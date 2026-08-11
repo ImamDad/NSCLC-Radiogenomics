@@ -1,0 +1,122 @@
+# MS-HGNN Configuration File
+# Model configuration
+model:
+  name: "MS-HGNN"
+  embedding_dim: 64
+  hidden_dim: 128
+  num_heads: 8
+  num_layers: 3
+  dropout: 0.3
+  attention_dropout: 0.3
+  feature_dropout: 0.2
+  graph_dropout: 0.3
+  use_batch_norm: true
+  use_residual: true
+  activation: "relu"
+
+# Modality encoders
+encoders:
+  ct:
+    name: "MedicalNet"
+    pretrained: true
+    freeze_stages: 3
+  pet:
+    name: "ResNet50"
+    pretrained: true
+    freeze_stages: 2
+  clinical:
+    name: "MLP"
+    hidden_dims: [32, 16]
+  genomic:
+    name: "MLP"
+    hidden_dims: [64, 32]
+
+# Meta-path configuration
+meta_paths:
+  immune:
+    start: "ct_features"
+    end: "survival"
+    nodes: ["ct_features", "immune_pathway", "survival"]
+  proliferation:
+    start: "pet_features"
+    end: "recurrence"
+    nodes: ["pet_features", "proliferation_pathway", "recurrence"]
+  treatment:
+    start: ["ct_features", "pet_features"]
+    end: "outcome"
+    nodes: ["ct_features", "pet_features", "treatment_pathway", "outcome"]
+
+# Training configuration
+training:
+  batch_size: 16
+  learning_rate: 3e-4
+  weight_decay: 1e-2
+  epochs: 100
+  early_stopping_patience: 50
+  early_stopping_min_delta: 0.001
+  grad_clip_norm: 1.0
+  use_amp: false  # Automatic Mixed Precision
+  num_workers: 4
+  
+  # Optimizer
+  optimizer: "AdamW"
+  scheduler: "CosineAnnealingLR"
+  scheduler_kwargs:
+    T_max: 100
+    eta_min: 1e-6
+  
+  # Loss weights
+  loss_weights:
+    survival: 1.0
+    recurrence: 1.0
+    regularization: 0.01
+
+# Data configuration
+data:
+  modalities: ["ct", "pet", "clinical", "genomic"]
+  test_year: 1996
+  validation_year: 1995
+  train_years: [1992, 1993, 1994]
+  
+  # Paths
+  raw_data_path: "./data/raw/"
+  processed_data_path: "./data/processed/"
+  split_path: "./data/splits/"
+  
+  # Augmentation
+  augmentation:
+    use_synthetic: true
+    n_synthetic_samples: 500
+    use_transfer_learning: true
+  
+  # Missing data
+  missing:
+    dropout_prob: 0.3
+    imputation_method: "zero"
+
+# Evaluation configuration
+evaluation:
+  metrics: ["c_index", "auc", "accuracy", "sensitivity", "specificity", "ppv", "npv", "f1", "brier", "ece"]
+  n_bootstrap: 1000
+  confidence_level: 0.95
+  n_monte_carlo: 50
+  calibration_bins: 10
+
+# Model compression
+compression:
+  prune_ratio: 0.5
+  quantization_bits: 8
+
+# Logging
+logging:
+  log_dir: "./logs/"
+  checkpoint_dir: "./checkpoints/"
+  figure_dir: "./figures/"
+  use_wandb: false
+  wandb_project: "ms-hgnn-nsclc"
+  wandb_entity: null
+  log_interval: 10
+  save_interval: 5
+
+# Random seeds for reproducibility
+seeds: [0, 42, 123, 456, 789]
