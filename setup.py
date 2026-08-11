@@ -1,32 +1,36 @@
-# setup.py
+"""
+Setup script for MS-HGNN package
+"""
+
 from setuptools import setup, find_packages
 
 setup(
-    name="ms-hhgn",
-    version="1.0.0",
+    name='ms-hgnn',
+    version='1.0.0',
+    description='Multi-Scale Hierarchical Graph Neural Network for NSCLC Prognosis',
+    author='Imam Dad, Jianfeng He',
+    author_email='jfenghe@kust.edu.cn',
     packages=find_packages(),
     install_requires=[
-        "torch>=1.9.0",
-        "torch-geometric>=2.0.0",
-        "numpy>=1.19.0",
-        "pandas>=1.2.0",
-        "scikit-learn>=0.24.0",
-        "scipy>=1.6.0",
-        "pyradiomics>=3.0.1",
-        "nibabel>=3.2.0",
-        "SimpleITK>=2.0.0",
-        "matplotlib>=3.3.0",
-        "seaborn>=0.11.0",
-        "tqdm>=4.62.0",
-        "lifelines>=0.26.0",
-        "statsmodels>=0.13.0",
-        "captum>=0.5.0",
-        "dgl>=0.8.0",
-        "wandb>=0.12.0",
-        "optuna>=2.10.0",
-        "monai>=0.8.0",
-        "torchvision>=0.10.0",
-        "pytorch-ignite>=0.4.0"
+        'torch>=1.12.0',
+        'torch-geometric>=2.2.0',
+        'numpy>=1.21.0',
+        'scipy>=1.9.0',
+        'pandas>=1.4.0',
+        'scikit-learn>=1.1.0',
+        'matplotlib>=3.5.0',
+        'seaborn>=0.11.0',
+        'pyyaml>=6.0',
+        'h5py>=3.7.0',
+        'tqdm>=4.64.0',
     ],
-    python_requires=">=3.8",
+    python_requires='>=3.9',
+    classifiers=[
+        'Development Status :: 4 - Beta',
+        'Intended Audience :: Science/Research',
+        'License :: OSI Approved :: MIT License',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    ],
 )
