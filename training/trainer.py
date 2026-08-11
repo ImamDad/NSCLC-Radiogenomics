@@ -1,348 +1,251 @@
-# training/trainer.py
+"""
+Training utilities for MS-HGNN
+"""
+
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
 import wandb
-from typing import Dict, List, Optional, Any
-import os
 import json
-from sklearn.metrics import roc_auc_score, accuracy_score, precision_recall_fscore_support
-from lifelines.utils import concordance_index
-import matplotlib.pyplot as plt
+from datetime import datetime
+from typing import Dict, Tuple, Optional
+import warnings
+warnings.filterwarnings('ignore')
 
 
 class Trainer:
-    """Trainer for MS-HHGN model"""
+    """Trainer class for MS-HGNN model"""
     
-    def __init__(self, model, config, device='cuda'):
+    def __init__(self, model: nn.Module, 
+                 train_loader: DataLoader,
+                 val_loader: DataLoader,
+                 config: dict,
+                 device: str = 'cuda'):
         self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
         self.config = config
         self.device = device
         
-        # Optimizer
-        self.optimizer = optim.AdamW(
-            model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay
-        )
+        # Setup optimizer
+        lr = config['training']['learning_rate']
+        wd = config['training']['weight_decay']
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         
-        # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=20, verbose=True
-        )
+        # Setup scheduler
+        scheduler_type = config['training'].get('scheduler', 'CosineAnnealingLR')
+        if scheduler_type == 'CosineAnnealingLR':
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer, 
+                T_max=config['training']['epochs'],
+                eta_min=config['training'].get('scheduler_kwargs', {}).get('eta_min', 1e-6)
+            )
+        elif scheduler_type == 'ReduceLROnPlateau':
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=0.5,
+                patience=10,
+                verbose=True
+            )
+        else:
+            self.scheduler = None
         
-        # Move model to device
-        self.model.to(device)
+        # Setup logging
+        self.log_dir = config['logging']['log_dir']
+        self.checkpoint_dir = config['logging']['checkpoint_dir']
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
         
         # Training state
-        self.current_epoch = 0
+        self.epoch = 0
         self.best_val_loss = float('inf')
-        self.best_model_state = None
+        self.best_val_metric = 0
         self.patience_counter = 0
         
-    def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
+        # History
+        self.history = {
+            'train_loss': [],
+            'val_loss': [],
+            'val_c_index': [],
+            'val_auc': [],
+            'learning_rates': []
+        }
+        
+        # Move model to device
+        self.model = self.model.to(device)
+        
+    def train_epoch(self) -> Dict:
         """Train for one epoch"""
         self.model.train()
+        epoch_loss = 0
+        epoch_losses = {'loss_survival': [], 'loss_recurrence': []}
         
-        total_loss = 0
-        total_survival_loss = 0
-        total_recurrence_loss = 0
-        all_survival_preds = []
-        all_recurrence_preds = []
-        all_survival_times = []
-        all_events = []
-        all_recurrence_labels = []
+        progress_bar = tqdm(self.train_loader, desc=f'Epoch {self.epoch}')
         
-        pbar = tqdm(train_loader, desc=f'Epoch {self.current_epoch} [Train]')
-        for batch in pbar:
-            # Move batch to device
-            batch = self._move_batch_to_device(batch)
+        for batch_idx, batch in enumerate(progress_bar):
+            # Move data to device
+            x_dict = {k: v.to(self.device) for k, v in batch['x_dict'].items()}
+            targets = {k: v.to(self.device) for k, v in batch['targets'].items()}
             
             # Forward pass
-            outputs = self.model(batch)
-            
-            # Compute loss
-            loss_dict = self.model.compute_loss(outputs, batch)
-            loss = loss_dict['total']
+            outputs = self.model(x_dict)
+            losses = self.model.get_loss(outputs, targets)
             
             # Backward pass
             self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            losses['total_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             
-            # Track metrics
-            total_loss += loss.item()
-            total_survival_loss += loss_dict['survival'].item()
-            total_recurrence_loss += loss_dict['recurrence'].item()
-            
-            all_survival_preds.append(outputs['survival_pred'].detach().cpu())
-            all_recurrence_preds.append(outputs['recurrence_pred'].detach().cpu())
-            all_survival_times.append(batch['survival_time'].cpu())
-            all_events.append(batch['event_indicator'].cpu())
-            if 'recurrence_label' in batch:
-                all_recurrence_labels.append(batch['recurrence_label'].cpu())
+            # Log losses
+            epoch_loss += losses['total_loss'].item()
+            epoch_losses['loss_survival'].append(losses['loss_survival'].item())
+            epoch_losses['loss_recurrence'].append(losses['loss_recurrence'].item())
             
             # Update progress bar
-            pbar.set_postfix({
-                'loss': loss.item(),
-                'surv_loss': loss_dict['survival'].item(),
-                'rec_loss': loss_dict['recurrence'].item()
+            progress_bar.set_postfix({
+                'loss': losses['total_loss'].item(),
+                's': losses['loss_survival'].item(),
+                'r': losses['loss_recurrence'].item()
             })
         
-        # Concatenate predictions
-        survival_preds = torch.cat(all_survival_preds).numpy().flatten()
-        recurrence_preds = torch.cat(all_recurrence_preds).numpy().flatten()
-        survival_times = torch.cat(all_survival_times).numpy()
-        events = torch.cat(all_events).numpy()
+        # Average losses
+        avg_loss = epoch_loss / len(self.train_loader)
+        avg_survival = np.mean(epoch_losses['loss_survival'])
+        avg_recurrence = np.mean(epoch_losses['loss_recurrence'])
         
-        # Compute metrics
-        c_index = concordance_index(survival_times, -survival_preds, events)
-        
-        metrics = {
-            'loss': total_loss / len(train_loader),
-            'survival_loss': total_survival_loss / len(train_loader),
-            'recurrence_loss': total_recurrence_loss / len(train_loader),
-            'c_index': c_index
+        return {
+            'loss': avg_loss,
+            'loss_survival': avg_survival,
+            'loss_recurrence': avg_recurrence
         }
+    
+    def validate(self) -> Dict:
+        """Validate the model"""
+        from src.evaluation.evaluator import Evaluator
         
-        if all_recurrence_labels:
-            recurrence_labels = torch.cat(all_recurrence_labels).numpy()
-            auc = roc_auc_score(recurrence_labels, recurrence_preds)
-            metrics['auc'] = auc
+        evaluator = Evaluator(self.model, self.device)
+        metrics = evaluator.evaluate(self.val_loader)
         
         return metrics
     
-    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """Validate model"""
-        self.model.eval()
+    def train(self, epochs: Optional[int] = None) -> Dict:
+        """
+        Full training loop
         
-        total_loss = 0
-        total_survival_loss = 0
-        total_recurrence_loss = 0
-        all_survival_preds = []
-        all_recurrence_preds = []
-        all_survival_times = []
-        all_events = []
-        all_recurrence_labels = []
-        all_uncertainties = []
+        Args:
+            epochs: number of epochs (defaults to config value)
+        Returns:
+            history: training history
+        """
+        if epochs is None:
+            epochs = self.config['training']['epochs']
         
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f'Epoch {self.current_epoch} [Val]'):
-                # Move batch to device
-                batch = self._move_batch_to_device(batch)
-                
-                # Forward pass
-                outputs = self.model(batch)
-                
-                # Compute loss
-                loss_dict = self.model.compute_loss(outputs, batch)
-                loss = loss_dict['total']
-                
-                # Track metrics
-                total_loss += loss.item()
-                total_survival_loss += loss_dict['survival'].item()
-                total_recurrence_loss += loss_dict['recurrence'].item()
-                
-                all_survival_preds.append(outputs['survival_pred'].cpu())
-                all_recurrence_preds.append(outputs['recurrence_pred'].cpu())
-                all_survival_times.append(batch['survival_time'].cpu())
-                all_events.append(batch['event_indicator'].cpu())
-                all_uncertainties.append(outputs['uncertainty'].cpu())
-                
-                if 'recurrence_label' in batch:
-                    all_recurrence_labels.append(batch['recurrence_label'].cpu())
+        patience = self.config['training']['early_stopping_patience']
+        min_delta = self.config['training']['early_stopping_min_delta']
         
-        # Concatenate predictions
-        survival_preds = torch.cat(all_survival_preds).numpy().flatten()
-        recurrence_preds = torch.cat(all_recurrence_preds).numpy().flatten()
-        survival_times = torch.cat(all_survival_times).numpy()
-        events = torch.cat(all_events).numpy()
-        uncertainties = torch.cat(all_uncertainties).numpy().flatten()
-        
-        # Compute metrics
-        c_index = concordance_index(survival_times, -survival_preds, events)
-        
-        metrics = {
-            'loss': total_loss / len(val_loader),
-            'survival_loss': total_survival_loss / len(val_loader),
-            'recurrence_loss': total_recurrence_loss / len(val_loader),
-            'c_index': c_index,
-            'mean_uncertainty': uncertainties.mean()
-        }
-        
-        if all_recurrence_labels:
-            recurrence_labels = torch.cat(all_recurrence_labels).numpy()
-            auc = roc_auc_score(recurrence_labels, recurrence_preds)
-            
-            # Compute precision, recall, f1 at optimal threshold
-            precisions, recalls, thresholds = precision_recall_fscore_support(
-                recurrence_labels, 
-                (recurrence_preds > 0.5).astype(int),
-                average='binary'
-            )[:3]
-            
-            metrics.update({
-                'auc': auc,
-                'precision': precisions,
-                'recall': recalls,
-                'f1': precisions * 2 * recalls / (precisions + recalls + 1e-8)
-            })
-        
-        return metrics
-    
-    def fit(self, train_loader: DataLoader, val_loader: DataLoader, 
-            callbacks: List = None, use_wandb: bool = False):
-        """Train the model"""
-        
-        for epoch in range(self.config.max_epochs):
-            self.current_epoch = epoch
+        for epoch in range(epochs):
+            self.epoch = epoch
             
             # Train
-            train_metrics = self.train_epoch(train_loader)
+            train_metrics = self.train_epoch()
             
             # Validate
-            val_metrics = self.validate(val_loader)
+            val_metrics = self.validate()
             
-            # Update learning rate
-            self.scheduler.step(val_metrics['loss'])
+            # Update scheduler
+            if self.scheduler is not None:
+                if isinstance(self.scheduler, ReduceLROnPlateau):
+                    self.scheduler.step(val_metrics['loss'])
+                else:
+                    self.scheduler.step()
             
-            # Log metrics
-            if use_wandb:
-                wandb.log({
-                    'train_loss': train_metrics['loss'],
-                    'train_c_index': train_metrics['c_index'],
-                    'val_loss': val_metrics['loss'],
-                    'val_c_index': val_metrics['c_index'],
-                    'val_auc': val_metrics.get('auc', 0),
-                    'learning_rate': self.optimizer.param_groups[0]['lr']
-                })
+            # Log
+            self.history['train_loss'].append(train_metrics['loss'])
+            self.history['val_loss'].append(val_metrics['loss'])
+            self.history['val_c_index'].append(val_metrics.get('c_index', 0))
+            self.history['val_auc'].append(val_metrics.get('auc', 0))
+            self.history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
             
             # Print metrics
             print(f"\nEpoch {epoch}:")
-            print(f"  Train - Loss: {train_metrics['loss']:.4f}, C-index: {train_metrics['c_index']:.4f}")
-            print(f"  Val   - Loss: {val_metrics['loss']:.4f}, C-index: {val_metrics['c_index']:.4f}, "
-                  f"AUC: {val_metrics.get('auc', 0):.4f}")
+            print(f"  Train Loss: {train_metrics['loss']:.4f}")
+            print(f"  Val Loss: {val_metrics['loss']:.4f}")
+            print(f"  Val C-index: {val_metrics.get('c_index', 0):.4f}")
+            print(f"  Val AUC: {val_metrics.get('auc', 0):.4f}")
+            print(f"  LR: {self.optimizer.param_groups[0]['lr']:.2e}")
             
-            # Check for improvement
-            if val_metrics['loss'] < self.best_val_loss - self.config.early_stopping_min_delta:
+            # Save best model
+            current_metric = val_metrics.get('c_index', 0)
+            if current_metric > self.best_val_metric:
+                self.best_val_metric = current_metric
                 self.best_val_loss = val_metrics['loss']
-                self.best_model_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
                 self.patience_counter = 0
-                print(f"  ✓ New best model! Loss: {self.best_val_loss:.4f}")
+                self.save_checkpoint('best_model.pth')
+                print(f"  ✓ New best model! C-index: {current_metric:.4f}")
             else:
                 self.patience_counter += 1
-                print(f"  No improvement for {self.patience_counter} epochs")
             
             # Early stopping
-            if self.patience_counter >= self.config.early_stopping_patience:
+            if self.patience_counter >= patience:
                 print(f"\nEarly stopping triggered after {epoch} epochs")
                 break
+            
+            # Save latest checkpoint
+            if epoch % self.config['logging']['save_interval'] == 0:
+                self.save_checkpoint(f'checkpoint_epoch_{epoch}.pth')
+            
+            # Log to wandb
+            if self.config['logging'].get('use_wandb', False):
+                wandb.log({
+                    'train_loss': train_metrics['loss'],
+                    'val_loss': val_metrics['loss'],
+                    'val_c_index': val_metrics.get('c_index', 0),
+                    'val_auc': val_metrics.get('auc', 0),
+                    'learning_rate': self.optimizer.param_groups[0]['lr'],
+                    'epoch': epoch
+                })
         
-        # Restore best model
-        if self.best_model_state is not None:
-            self.model.load_state_dict(self.best_model_state)
-            print("\nRestored best model from checkpoint")
+        # Load best model
+        self.load_checkpoint('best_model.pth')
+        
+        return self.history
     
-    def test(self, test_loader: DataLoader) -> Dict[str, Any]:
-        """Evaluate on test set"""
-        self.model.eval()
-        
-        all_survival_preds = []
-        all_recurrence_preds = []
-        all_survival_times = []
-        all_events = []
-        all_recurrence_labels = []
-        all_uncertainties = []
-        all_patient_ids = []
-        all_attention_weights = []
-        
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc='Testing'):
-                # Move batch to device
-                batch = self._move_batch_to_device(batch)
-                
-                # Forward pass with attention
-                outputs = self.model(batch, return_attention=True)
-                
-                all_survival_preds.append(outputs['survival_pred'].cpu())
-                all_recurrence_preds.append(outputs['recurrence_pred'].cpu())
-                all_survival_times.append(batch['survival_time'].cpu())
-                all_events.append(batch['event_indicator'].cpu())
-                all_uncertainties.append(outputs['uncertainty'].cpu())
-                all_patient_ids.extend(batch['patient_ids'])
-                
-                if 'recurrence_label' in batch:
-                    all_recurrence_labels.append(batch['recurrence_label'].cpu())
-                
-                if 'cross_attention' in outputs:
-                    all_attention_weights.append(outputs['cross_attention'])
-        
-        # Concatenate
-        survival_preds = torch.cat(all_survival_preds).numpy().flatten()
-        recurrence_preds = torch.cat(all_recurrence_preds).numpy().flatten()
-        survival_times = torch.cat(all_survival_times).numpy()
-        events = torch.cat(all_events).numpy()
-        uncertainties = torch.cat(all_uncertainties).numpy().flatten()
-        
-        # Compute metrics
-        c_index = concordance_index(survival_times, -survival_preds, events)
-        
-        results = {
-            'c_index': c_index,
-            'survival_preds': survival_preds,
-            'recurrence_preds': recurrence_preds,
-            'survival_times': survival_times,
-            'events': events,
-            'uncertainties': uncertainties,
-            'patient_ids': all_patient_ids
-        }
-        
-        if all_recurrence_labels:
-            recurrence_labels = torch.cat(all_recurrence_labels).numpy()
-            auc = roc_auc_score(recurrence_labels, recurrence_preds)
-            results['auc'] = auc
-            results['recurrence_labels'] = recurrence_labels
-        
-        if all_attention_weights:
-            results['attention_weights'] = all_attention_weights
-        
-        return results
-    
-    def _move_batch_to_device(self, batch: Dict) -> Dict:
-        """Move batch tensors to device"""
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                batch[key] = value.to(self.device)
-            elif isinstance(value, dict):
-                for sub_key, sub_value in value.items():
-                    if isinstance(sub_value, torch.Tensor):
-                        batch[key][sub_key] = sub_value.to(self.device)
-        return batch
-    
-    def save_checkpoint(self, path: str):
-        """Save model checkpoint"""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+    def save_checkpoint(self, filename: str):
+        """Save checkpoint"""
         checkpoint = {
+            'epoch': self.epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
-            'current_epoch': self.current_epoch,
+            'best_val_metric': self.best_val_metric,
+            'history': self.history,
             'config': self.config
         }
+        
+        path = os.path.join(self.checkpoint_dir, filename)
         torch.save(checkpoint, path)
-        print(f"Checkpoint saved to {path}")
+        print(f"  Checkpoint saved: {path}")
     
-    def load_checkpoint(self, path: str):
-        """Load model checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.best_val_loss = checkpoint['best_val_loss']
-        self.current_epoch = checkpoint['current_epoch']
-        print(f"Checkpoint loaded from {path}")
+    def load_checkpoint(self, filename: str):
+        """Load checkpoint"""
+        path = os.path.join(self.checkpoint_dir, filename)
+        if os.path.exists(path):
+            checkpoint = torch.load(path, map_location=self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.epoch = checkpoint['epoch']
+            self.best_val_loss = checkpoint['best_val_loss']
+            self.best_val_metric = checkpoint['best_val_metric']
+            self.history = checkpoint['history']
+            print(f"  Checkpoint loaded: {path}")
+            return True
+        else:
+            print(f"  Checkpoint not found: {path}")
+            return False
